@@ -163,6 +163,36 @@ test('caching-streaming and cache-control: returns prompt_tokens_details', async
   }
 });
 
+test('streaming DeepSeek JSON errors are returned as OpenAI-shaped errors instead of empty SSE', async () => {
+  const restore = setupFetchMock(() => {
+    return new Response(
+      JSON.stringify({ code: 40301, msg: 'INVALID_POW_RESPONSE', data: null }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'ping' }],
+        stream: true,
+      })
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 401);
+    assert.match(res.headers.get('Content-Type') || '', /^application\/json/);
+    const body = await res.json();
+    assert.strictEqual(body.error.code, 'deepseek_session_invalid');
+    assert.match(body.error.message, /INVALID_POW_RESPONSE|proof-of-work/i);
+  } finally {
+    restore();
+  }
+});
+
 test('openai-requests-are-stateless: each request starts a fresh DeepSeek turn', async () => {
   let capturedPayloads: any[] = [];
 
@@ -320,6 +350,151 @@ test('hermes-style XML tool calls are converted to structured OpenAI tool_calls'
   }
 });
 
+test('JSON tool calls without name infer the tool from declared parameters', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"<tool_call>{\\"file_path\\": \\"/workspace/package.json\\"}</tool_call>"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'read package' }],
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } } }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.choices[0].message.content, null);
+    assert.strictEqual(body.choices[0].finish_reason, 'tool_calls');
+    assert.strictEqual(body.choices[0].message.tool_calls[0].function.name, 'read_file');
+    assert.deepStrictEqual(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments), {
+      file_path: '/workspace/package.json',
+    });
+  } finally {
+    restore();
+  }
+});
+
+test('natural-language tool_call blocks are recovered for safe directory listing intent', async () => {
+  const previousNaturalInference = process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE;
+  process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE = 'true';
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"<tool_call>List the deepsproxy directory contents</tool_call>"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'explore project' }],
+        stream: true,
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'list_directory',
+            description: 'List directory contents',
+            parameters: {
+              type: 'object',
+              properties: { path: { type: 'string' } },
+              required: ['path']
+            }
+          }
+        }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    const text = await res.text();
+    assert.ok(!text.includes('<tool_call'), 'malformed tool XML must not leak into SSE content');
+    assert.ok(text.includes('"tool_calls"'), 'SSE must expose structured tool_calls');
+    assert.ok(text.includes('"name":"list_directory"'), 'Recovered tool call must use the declared tool');
+    assert.ok(text.includes('\\"path\\":\\"deepsproxy\\"'), 'Recovered tool call must infer the directory path');
+    assert.ok(text.includes('"finish_reason":"tool_calls"'));
+  } finally {
+    restore();
+    if (previousNaturalInference === undefined) {
+      delete process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE;
+    } else {
+      process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE = previousNaturalInference;
+    }
+  }
+});
+
+test('natural-language tool_call inference is disabled by default', async () => {
+  const previousNaturalInference = process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE;
+  delete process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE;
+
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"<tool_call>List the /home/user/Downloads/testeseek directory contents</tool_call>"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'explore folder' }],
+        stream: true,
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'list_directory',
+            description: 'List directory contents',
+            parameters: {
+              type: 'object',
+              properties: { path: { type: 'string' } },
+              required: ['path']
+            }
+          }
+        }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    const text = await res.text();
+    assert.ok(!text.includes('<tool_call'), 'malformed natural-language tool XML must not leak');
+    assert.ok(!text.includes('"tool_calls"'), 'natural language must not become executable tool call by default');
+    assert.ok(text.includes('"finish_reason":"stop"'));
+  } finally {
+    restore();
+    if (previousNaturalInference === undefined) {
+      delete process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE;
+    } else {
+      process.env.DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE = previousNaturalInference;
+    }
+  }
+});
+
 test('streaming Hermes-style XML tool calls do not leak as content', async () => {
   const restore = setupFetchMock((url) => {
     const stream = new ReadableStream({
@@ -350,6 +525,173 @@ test('streaming Hermes-style XML tool calls do not leak as content', async () =>
     assert.ok(!text.includes('<parameter'), 'parameter XML must not leak into SSE content');
     assert.ok(text.includes('"tool_calls"'), 'SSE must expose structured tool_calls');
     assert.ok(text.includes('"finish_reason":"tool_calls"'));
+  } finally {
+    restore();
+  }
+});
+
+test('plain-text Zed tool calls are converted to structured OpenAI tool_calls', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"Vou te mostrar:\\n\\nTool: read_file\\nArguments: {\\"file_path\\": \\"/workspace/src/routes/chat.ts\\", \\"start_line\\": 1, \\"end_line\\": 80}\\nTool: read_file\\nArguments: {\\"file_path\\": \\"/workspace/package.json\\"}\\n\\nTool Response: isso nao deveria aparecer como texto"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'debug repo' }],
+        stream: false,
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'read_file',
+            parameters: {
+              type: 'object',
+              properties: {
+                file_path: { type: 'string' },
+                start_line: { type: 'number' },
+                end_line: { type: 'number' }
+              },
+              required: ['file_path']
+            }
+          }
+        }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    const body = await res.json();
+    assert.strictEqual(body.choices[0].message.content, null);
+    assert.strictEqual(body.choices[0].finish_reason, 'tool_calls');
+    assert.strictEqual(body.choices[0].message.tool_calls.length, 2);
+    assert.strictEqual(body.choices[0].message.tool_calls[0].function.name, 'read_file');
+    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments);
+    assert.strictEqual(args.file_path, '/workspace/src/routes/chat.ts');
+    assert.strictEqual(args.start_line, 1);
+    assert.strictEqual(args.end_line, 80);
+  } finally {
+    restore();
+  }
+});
+
+test('streaming plain-text Zed tool calls do not leak as assistant text', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"Assistant: vou ler.\\n\\nTool: read_file\\n"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"Arguments: {\\"file_path\\": \\"/workspace/package.json\\"}\\n"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'debug repo' }],
+        stream: true,
+        tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object', properties: { file_path: { type: 'string' } } } } }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    const text = await res.text();
+    assert.ok(!text.includes('Tool: read_file'), 'plain text tool call must not leak into SSE content');
+    assert.ok(!text.includes('Tool Response:'), 'hallucinated tool response marker must not leak into SSE content');
+    assert.ok(text.includes('"tool_calls"'), 'SSE must expose structured tool_calls');
+    assert.ok(text.includes('"finish_reason":"tool_calls"'));
+  } finally {
+    restore();
+  }
+});
+
+test('plain-text tool calls missing required arguments are not emitted', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"Tool: list_directory\\nArguments: {}\\n"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'list folder' }],
+        stream: true,
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'list_directory',
+            parameters: {
+              type: 'object',
+              properties: { path: { type: 'string' } },
+              required: ['path']
+            }
+          }
+        }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    const text = await res.text();
+    assert.ok(!text.includes('Tool: list_directory'), 'invalid plain tool text must not leak');
+    assert.ok(!text.includes('"tool_calls"'), 'missing required path must not be emitted to the client');
+    assert.ok(text.includes('"finish_reason":"stop"'));
+  } finally {
+    restore();
+  }
+});
+
+test('orphan tool closing tags are stripped from streaming output', async () => {
+  const restore = setupFetchMock((url) => {
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"</tool_call>"}\n\n'));
+        c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        c.close();
+      }
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'liste arquivos' }],
+        stream: true,
+        tools: [{ type: 'function', function: { name: 'list_directory', parameters: { type: 'object', properties: {} } } }]
+      })
+    });
+
+    const res = await app.fetch(req);
+    const text = await res.text();
+    assert.ok(!text.includes('</tool_call>'), 'orphan closing tool tag must not leak');
+    assert.ok(text.includes('"finish_reason":"stop"'));
   } finally {
     restore();
   }

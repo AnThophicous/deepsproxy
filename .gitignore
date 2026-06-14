@@ -1,8 +1,13 @@
 node_modules/
 dist/
 deepseek_profile/
+.deepsproxy/
+base/
+deepseek-internal-main/
 .env
 .env.local
+*.har
+storage-state*.json
 *.log
 .DS_Store
 coverage/

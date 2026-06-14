@@ -9,6 +9,7 @@
  */
 
 import { getDeepSeekHeaders } from './playwright.ts';
+import { createDeepSeekPowResponse } from './pow.ts';
 
 // In-memory state to track the last message ID per session to avoid overwriting
 // Use globalThis to ensure it survives module reloads in some test environments
@@ -32,15 +33,74 @@ export interface DeepSeekPayload {
   preempt: boolean;
 }
 
+async function validateDeepSeekStream(response: Response): Promise<ReadableStream> {
+  if (!response.body) {
+    throw new Error('DeepSeek response did not include a stream body.');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+
+  try {
+    const first = await reader.read();
+    if (first.done) {
+      throw new Error('DeepSeek returned an empty response body.');
+    }
+
+    const firstText = decoder.decode(first.value, { stream: true });
+    const trimmed = firstText.trimStart();
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const code = parsed?.code ?? parsed?.error?.code ?? 'unknown';
+        const message = parsed?.msg ?? parsed?.message ?? parsed?.error?.message ?? 'Unknown DeepSeek error.';
+        if (code === 40301 || /INVALID_POW_RESPONSE/i.test(String(message))) {
+          throw new Error(`DeepSeek rejected the generated proof-of-work response (${message}). The local PoW solver may be stale, or the cached session headers from npm run login may need to be refreshed.`);
+        }
+        throw new Error(`DeepSeek returned an API error (${code}): ${message}`);
+      } catch (error) {
+        if (error instanceof SyntaxError) {
+          throw new Error(`DeepSeek returned non-SSE JSON that could not be parsed: ${trimmed.slice(0, 200)}`);
+        }
+        throw error;
+      }
+    }
+
+    return new ReadableStream({
+      async start(controller) {
+        controller.enqueue(first.value);
+        try {
+          while (true) {
+            const next = await reader.read();
+            if (next.done) {
+              controller.close();
+              break;
+            }
+            controller.enqueue(next.value);
+          }
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+      cancel() {
+        reader.releaseLock();
+      },
+    });
+  } catch (error) {
+    reader.releaseLock();
+    throw error;
+  }
+}
+
 export async function createDeepSeekStream(
   prompt: string,
   enableThinking: boolean,
   isProModel: boolean = false,
   forcedParentId?: number | null
 ): Promise<{ stream: ReadableStream, headers: Record<string, string>, uiSessionId: string }> {
-  // Obtain fresh headers/PoW from Playwright
-  // If forcedParentId is null, it means we are explicitly starting a new session
-  const { headers, chatSessionId, parentMessageId } = await getDeepSeekHeaders(forcedParentId === null);
+  // Runtime should use the cached session captured by `npm run login`.
+  // `forcedParentId` controls only conversation continuity, not browser startup.
+  const { headers, chatSessionId, parentMessageId } = await getDeepSeekHeaders(false);
 
   // Determine the actual parent ID:
   // 1. If forcedParentId is provided (even if null), use it.
@@ -65,6 +125,15 @@ export async function createDeepSeekStream(
     preempt: false
   };
 
+  let powResponse = headers['x-ds-pow-response'] || '';
+  if (!process.env.TEST_MOCK_PLAYWRIGHT) {
+    powResponse = await createDeepSeekPowResponse({
+      scene: 'completion_like',
+      targetPath: '/api/v0/chat/completion',
+      sessionHeaders: headers,
+    });
+  }
+
   const response = await fetch('https://chat.deepseek.com/api/v0/chat/completion', {
     method: 'POST',
     headers: {
@@ -73,7 +142,7 @@ export async function createDeepSeekStream(
       'authorization': headers['authorization'],
       'content-type': 'application/json',
       'origin': 'https://chat.deepseek.com',
-      'x-ds-pow-response': headers['x-ds-pow-response'],
+      'x-ds-pow-response': powResponse,
       'x-hif-dliq': headers['x-hif-dliq'],
       'x-hif-leim': headers['x-hif-leim'],
       'x-app-version': '2.0.0',
@@ -89,5 +158,6 @@ export async function createDeepSeekStream(
     throw new Error(`Failed to fetch from DeepSeek: ${response.status} ${response.statusText} - ${errText}`);
   }
 
-  return { stream: response.body, headers, uiSessionId: chatSessionId };
+  const stream = await validateDeepSeekStream(response);
+  return { stream, headers, uiSessionId: chatSessionId };
 }

@@ -16,6 +16,7 @@ import { OpenAIRequest, ChoiceDelta, Message, ToolCall, Usage } from '../utils/t
 import { robustParseJSON } from '../utils/json.ts';
 import { getModelTelemetry, recordSuccess, recordFailure } from '../services/telemetry.ts';
 import { compressMessages } from '../utils/compression.ts';
+import { modelNotFoundError, resolveModel } from '../services/models.ts';
 
 const TOOL_START = '<tool_call>';
 const TOOL_END = '</tool_call>';
@@ -90,6 +91,15 @@ function appendToolInstructions(systemPrompt: string, body: OpenAIRequest): stri
   if (!bodyAny.tools || !Array.isArray(bodyAny.tools) || bodyAny.tools.length === 0) {
     return systemPrompt;
   }
+  if (bodyAny.tool_choice === 'none') {
+    return systemPrompt;
+  }
+  const disableToolPrompt = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.DEEPSPROXY_DISABLE_TOOL_PROMPT || '').toLowerCase()
+  );
+  if (disableToolPrompt) {
+    return systemPrompt;
+  }
 
   const formattedTools = bodyAny.tools.map((t: any) => {
     if (t.type === 'function') {
@@ -103,7 +113,11 @@ function appendToolInstructions(systemPrompt: string, body: OpenAIRequest): stri
   });
   const toolsJson = JSON.stringify(formattedTools, null, 2);
 
-  systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nRULES:\n1. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n2. Do NOT output any other text after your <tool_call> blocks. Wait for the user to provide the tool response.\n3. The JSON must be valid and accurately follow the tool's parameters.\n\n`;
+  const parallelRule = bodyAny.parallel_tool_calls === false
+    ? 'Call at most one tool in this response.'
+    : 'You may call multiple tools by outputting multiple <tool_call> blocks consecutively.';
+
+  systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nRULES:\n1. ${parallelRule}\n2. Do NOT output any other text after your <tool_call> blocks. Wait for the user to provide the tool response.\n3. The JSON must be valid and accurately follow the tool's parameters.\n4. Never put prose inside <tool_call>. Never use XML <parameter> tags. Always include the exact tool name in the JSON "name" field.\n\n`;
 
   if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
     const forcedTool = bodyAny.tool_choice.function.name;
@@ -142,25 +156,298 @@ function extractToolName(openTag: string, block: string): string {
   const nameTagMatch = block.match(/<name>([\s\S]*?)<\/name>/i);
   if (nameTagMatch) return decodeXmlEntities(nameTagMatch[1].trim());
 
+  const functionTagMatch = block.match(/<(?:function|tool|tool_name|function_name)>([\s\S]*?)<\/(?:function|tool|tool_name|function_name)>/i);
+  if (functionTagMatch) return decodeXmlEntities(functionTagMatch[1].trim());
+
   return '';
+}
+
+interface ToolDescriptor {
+  name: string;
+  description: string;
+  properties: Record<string, any>;
+  required: string[];
+}
+
+function envFlag(name: string, defaultValue = false): boolean {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultValue;
+  return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
+}
+
+function getToolFunction(tool: any): any {
+  if (tool?.type === 'function' && tool.function) return tool.function;
+  if (tool?.function && typeof tool.function === 'object') return tool.function;
+  return tool;
+}
+
+function getToolDescriptors(tools: any[]): ToolDescriptor[] {
+  if (!Array.isArray(tools)) return [];
+  return tools.flatMap((tool: any) => {
+    const fn = getToolFunction(tool);
+    if (!fn || typeof fn.name !== 'string' || fn.name.length === 0) return [];
+    const parameters = fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : {};
+    const properties = parameters.properties && typeof parameters.properties === 'object' ? parameters.properties : {};
+    const required = Array.isArray(parameters.required) ? parameters.required.filter((v: unknown): v is string => typeof v === 'string') : [];
+    return [{
+      name: fn.name,
+      description: typeof fn.description === 'string' ? fn.description : '',
+      properties,
+      required,
+    }];
+  });
+}
+
+function normalizeToolName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function resolveDeclaredToolName(name: string, tools: any[]): string {
+  if (!name) return '';
+  const descriptors = getToolDescriptors(tools);
+  if (descriptors.length === 0) return name;
+
+  const exact = descriptors.find(d => d.name === name);
+  if (exact) return exact.name;
+
+  const normalized = normalizeToolName(name);
+  const normalizedMatch = descriptors.find(d => normalizeToolName(d.name) === normalized);
+  return normalizedMatch?.name || '';
 }
 
 function inferToolNameFromParameters(args: Record<string, unknown>, tools: any[]): string {
   const argKeys = Object.keys(args);
-  if (argKeys.length === 0 || !Array.isArray(tools)) return '';
+  if (argKeys.length === 0) return '';
 
-  const matches = tools.filter((tool: any) => {
-    const fn = tool?.type === 'function' ? tool.function : tool?.function;
-    const properties = fn?.parameters?.properties || {};
+  const matches = getToolDescriptors(tools).filter((tool) => {
+    const properties = tool.properties || {};
     return argKeys.every(k => Object.prototype.hasOwnProperty.call(properties, k));
   });
 
   if (matches.length === 1) {
-    const fn = matches[0]?.type === 'function' ? matches[0].function : matches[0]?.function;
-    return fn?.name || '';
+    return matches[0].name;
   }
 
   return '';
+}
+
+function parseArgumentsCandidate(candidate: unknown): Record<string, unknown> {
+  if (!candidate) return {};
+  if (typeof candidate === 'string') {
+    try {
+      const parsed = robustParseJSON(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {}
+    return {};
+  }
+  if (typeof candidate === 'object' && !Array.isArray(candidate)) {
+    return candidate as Record<string, unknown>;
+  }
+  return {};
+}
+
+function normalizeParsedToolCall(parsed: any, openTag: string, block: string, tools: any[]): any | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+
+  const attrToolName = extractToolName(openTag, block);
+  const descriptors = getToolDescriptors(tools);
+
+  if (!attrToolName) {
+    const topLevelKeys = Object.keys(parsed);
+    if (topLevelKeys.length === 1) {
+      const declared = resolveDeclaredToolName(topLevelKeys[0], tools);
+      if (declared) {
+        return { name: declared, arguments: parseArgumentsCandidate(parsed[topLevelKeys[0]]) };
+      }
+    }
+  }
+
+  let toolName = attrToolName;
+  let args: Record<string, unknown> = {};
+
+  if (parsed.function && typeof parsed.function === 'object' && !Array.isArray(parsed.function)) {
+    const fn = parsed.function as Record<string, unknown>;
+    if (!toolName && typeof fn.name === 'string') toolName = fn.name;
+    args = parseArgumentsCandidate(fn.arguments ?? fn.parameters ?? fn.args);
+  }
+
+  if (!toolName) {
+    for (const key of ['name', 'tool', 'tool_name', 'function_name', 'function']) {
+      if (typeof parsed[key] === 'string') {
+        toolName = parsed[key];
+        break;
+      }
+    }
+  }
+
+  if (Object.keys(args).length === 0) {
+    args = parseArgumentsCandidate(parsed.arguments ?? parsed.args ?? parsed.parameters ?? parsed.params ?? parsed.input);
+  }
+
+  if (Object.keys(args).length === 0) {
+    const reserved = new Set(['name', 'tool', 'tool_name', 'function_name', 'function', 'arguments', 'args', 'parameters', 'params', 'input']);
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!reserved.has(key)) args[key] = value;
+    }
+  }
+
+  if (!toolName) {
+    toolName = inferToolNameFromParameters(args, tools);
+  }
+
+  const declared = resolveDeclaredToolName(toolName, tools);
+  if (descriptors.length > 0 && !declared) return null;
+  toolName = declared || toolName;
+
+  if (!toolName) return null;
+  return { name: toolName, arguments: args };
+}
+
+function cleanInferredValue(value: string): string {
+  return decodeXmlEntities(value)
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/^(?:the|a|an)\s+/i, '')
+    .replace(/\s+(?:directory|folder)(?:['’]s)?(?:\s+contents?)?$/i, '')
+    .replace(/[.;:,]+$/g, '')
+    .trim();
+}
+
+function firstQuotedText(text: string): string {
+  const match = text.match(/["'`]([^"'`\n]+)["'`]/);
+  return match ? cleanInferredValue(match[1]) : '';
+}
+
+function pickStringParam(tool: ToolDescriptor, preferred: string[]): string {
+  const lowerPreferred = preferred.map(p => p.toLowerCase());
+  const propEntries = Object.entries(tool.properties || {});
+  for (const preferredName of lowerPreferred) {
+    const found = propEntries.find(([key]) => key.toLowerCase() === preferredName);
+    if (found) return found[0];
+  }
+
+  const requiredString = tool.required.find((key) => {
+    const schema = tool.properties?.[key];
+    return !schema || schema.type === 'string' || Array.isArray(schema.type) && schema.type.includes('string');
+  });
+  if (requiredString) return requiredString;
+
+  const onlyString = propEntries.filter(([, schema]) => !schema || schema.type === 'string' || Array.isArray(schema.type) && schema.type.includes('string'));
+  if (onlyString.length === 1) return onlyString[0][0];
+
+  return tool.required[0] || propEntries[0]?.[0] || '';
+}
+
+function inferDirectoryPath(text: string): string {
+  const quoted = firstQuotedText(text);
+  if (quoted) return quoted;
+
+  const patterns = [
+    /\blist(?:\s+the)?\s+(.+?)\s+(?:directory|folder)(?:['’]s)?(?:\s+contents?)?/i,
+    /\b(?:directory|folder)\s+(?:called|named)?\s*([^.\n,;]+)/i,
+    /\bcontents?\s+of\s+(?:the\s+)?(.+?)(?:\s+(?:directory|folder))?(?:[.\n,;]|$)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return cleanInferredValue(match[1]);
+  }
+
+  return '';
+}
+
+function inferFilePath(text: string): string {
+  const quoted = firstQuotedText(text);
+  if (quoted) return quoted;
+
+  const patterns = [
+    /\bread(?:\s+the)?\s+(?:file\s+)?([^.\n,;]+)/i,
+    /\bopen(?:\s+the)?\s+(?:file\s+)?([^.\n,;]+)/i,
+    /\bfile\s+([^.\n,;]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return cleanInferredValue(match[1]);
+  }
+
+  return '';
+}
+
+function descriptorMatchesIntent(tool: ToolDescriptor, intent: 'list_directory' | 'read_file' | 'search'): boolean {
+  const haystack = `${tool.name} ${tool.description}`.toLowerCase();
+  if (intent === 'list_directory') {
+    return /(?:list|ls|show)/i.test(haystack) && /(?:director|folder|dir|files?)/i.test(haystack);
+  }
+  if (intent === 'read_file') {
+    return /(?:read|open|view|cat)/i.test(haystack) && /file/i.test(haystack);
+  }
+  return /(?:search|grep|find|ripgrep|rg)/i.test(haystack);
+}
+
+function inferToolCallFromNaturalText(block: string, tools: any[]): any | null {
+  if (!envFlag('DEEPSPROXY_ENABLE_NATURAL_TOOL_INFERENCE', false)) return null;
+
+  const descriptors = getToolDescriptors(tools);
+  if (descriptors.length === 0) return null;
+
+  const text = decodeXmlEntities(sanitizeToolArtifacts(block).replace(/<[^>]+>/g, ' ')).trim();
+  if (!text) return null;
+
+  const mentioned = descriptors.filter((tool) => {
+    const lower = text.toLowerCase();
+    return lower.includes(tool.name.toLowerCase()) || lower.includes(tool.name.replace(/[_:-]+/g, ' ').toLowerCase());
+  });
+
+  let tool: ToolDescriptor | undefined = mentioned.length === 1 ? mentioned[0] : undefined;
+  const lower = text.toLowerCase();
+  let intent: 'list_directory' | 'read_file' | 'search' | null = null;
+
+  if (!tool && /\b(?:list|show|inspect|explore|see)\b/.test(lower) && /\b(?:directory|folder|dir|contents?|files?)\b/.test(lower)) {
+    intent = 'list_directory';
+  } else if (!tool && /\b(?:read|open|view)\b/.test(lower) && /\bfile\b/.test(lower)) {
+    intent = 'read_file';
+  } else if (!tool && /\b(?:search|grep|find)\b/.test(lower)) {
+    intent = 'search';
+  }
+
+  if (!tool && intent) {
+    const intentMatches = descriptors.filter(d => descriptorMatchesIntent(d, intent!));
+    if (intentMatches.length === 1) tool = intentMatches[0];
+  }
+
+  if (!tool) return null;
+
+  const args: Record<string, unknown> = {};
+  if (intent === 'list_directory' || descriptorMatchesIntent(tool, 'list_directory')) {
+    const param = pickStringParam(tool, ['path', 'directory', 'dir', 'directory_path', 'folder', 'folder_path']);
+    if (param) args[param] = inferDirectoryPath(text) || '.';
+  } else if (intent === 'read_file' || descriptorMatchesIntent(tool, 'read_file')) {
+    const param = pickStringParam(tool, ['file_path', 'path', 'file', 'filename']);
+    const value = inferFilePath(text);
+    if (param && value) args[param] = value;
+  } else if (intent === 'search' || descriptorMatchesIntent(tool, 'search')) {
+    const param = pickStringParam(tool, ['query', 'pattern', 'search', 'term']);
+    const value = firstQuotedText(text) || text;
+    if (param && value) args[param] = value;
+  }
+
+  const missingRequired = tool.required.filter(key => args[key] === undefined);
+  if (missingRequired.length > 0) return null;
+  return { name: tool.name, arguments: args };
+}
+
+function missingRequiredToolArgs(toolName: string, args: Record<string, unknown>, tools: any[]): string[] {
+  if (!Array.isArray(tools) || tools.length === 0) return [];
+  const descriptor = getToolDescriptors(tools).find(tool => tool.name === toolName);
+  if (!descriptor) return [];
+
+  return descriptor.required.filter((key) => {
+    const value = args[key];
+    return value === undefined || value === null || (typeof value === 'string' && value.trim().length === 0);
+  });
 }
 
 function parseXmlParameterToolCall(block: string, openTag: string, tools: any[]): any | null {
@@ -171,7 +458,7 @@ function parseXmlParameterToolCall(block: string, openTag: string, tools: any[])
     args[match[1]] = coerceParameterValue(match[2]);
   }
 
-  if (Object.keys(args).length === 0) return null;
+  if (Object.keys(args).length === 0 && /<parameter\b/i.test(block)) return null;
 
   const toolName = extractToolName(openTag, block) || inferToolNameFromParameters(args, tools);
   if (!toolName) return null;
@@ -186,10 +473,53 @@ function parseToolCallBlock(block: string, openTag: string, tools: any[]): any {
   const parsedJson = robustParseJSON(block);
   if (!parsedJson) throw new Error('Empty tool call');
 
-  const attrToolName = extractToolName(openTag, block);
-  if (attrToolName && !parsedJson.name) parsedJson.name = attrToolName;
+  const normalized = normalizeParsedToolCall(parsedJson, openTag, block, tools);
+  if (!normalized) throw new Error('Tool call missing or unknown name');
 
-  return parsedJson;
+  return normalized;
+}
+
+function declaredToolNames(tools: any[]): Set<string> {
+  return new Set(getToolDescriptors(tools).map(tool => tool.name));
+}
+
+function parsePlainTextToolCalls(text: string, tools: any[]): Array<{ name: string; arguments: Record<string, unknown> }> {
+  if (!Array.isArray(tools) || tools.length === 0) return [];
+
+  const names = declaredToolNames(tools);
+  const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+  const searchable = text.split(/\n\s*Tool Response\s*:/i)[0] || text;
+  const toolCallRe = /(?:^|\n)\s*Tool\s*:\s*([A-Za-z0-9_.:-]+)\s*\n\s*Arguments\s*:\s*([\s\S]*?)(?=\n\s*Tool\s*:|\n\s*Tool Response\s*:|\n\s*Assistant\s*:|$)/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = toolCallRe.exec(searchable)) !== null) {
+    const name = match[1]?.trim();
+    const rawArgs = match[2]?.trim() || '{}';
+    if (!name || !names.has(name)) continue;
+
+    const parsedArgs = robustParseJSON(rawArgs);
+    if (!parsedArgs || typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) continue;
+    const args = parsedArgs as Record<string, unknown>;
+    if (missingRequiredToolArgs(name, args, tools).length > 0) continue;
+    calls.push({ name, arguments: args });
+  }
+
+  return calls;
+}
+
+function sanitizeToolArtifacts(text: string): string {
+  return text
+    .replace(/(?:^|\n)\s*Tool\s*:\s*[A-Za-z0-9_.:-]+\s*\n\s*Arguments\s*:[\s\S]*?(?=\n\s*(?:Tool\s*:|Tool Response\s*:|Assistant\s*:)|$)/gi, '\n')
+    .replace(/(?:^|\n)\s*Tool Response\s*:[\s\S]*$/gi, '')
+    .replace(/<tool_call\b[^>]*>/gi, '')
+    .replace(/<\/tool_call>/gi, '')
+    .replace(/<parameter\b[^>]*>/gi, '')
+    .replace(/<\/parameter>/gi, '');
+}
+
+function warnToolParser(message: string, error: unknown) {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.warn(`[chat] ${message}: ${detail}`);
 }
 
 function findToolOpen(buffer: string): { startIdx: number; endIdx: number; openTag: string } | null {
@@ -234,6 +564,10 @@ function makeChunk(completionId: string, model: string, delta: any, finishReason
   return chunk;
 }
 
+function isSessionInvalidError(message: string): boolean {
+  return /INVALID_POW_RESPONSE|proof-of-work|cached session proof/i.test(message);
+}
+
 async function parseDeepSeekStreamToOpenAI(
   deepSeekStream: ReadableStream,
   completionId: string,
@@ -258,6 +592,7 @@ async function parseDeepSeekStreamToOpenAI(
   const toolCalls: ToolCall[] = [];
   let buffer = '';
   let pendingToolLeadIn = '';
+  const deferTextForToolDetection = Array.isArray(tools) && tools.length > 0;
 
   const emitContent = async (text: string) => {
     if (!text || emittedToolCallCount > 0) return;
@@ -285,15 +620,19 @@ async function parseDeepSeekStreamToOpenAI(
       args[unclosedParameterMatch[1]] = coerceParameterValue(unclosedParameterMatch[2]);
     }
 
-    if (Object.keys(args).length === 0) throw new Error('Unrecoverable tool call');
     const toolName = extractToolName(openTag, block) || inferToolNameFromParameters(args, tools);
-    if (!toolName) throw new Error('Recoverable tool call missing name');
-    return { name: toolName, arguments: args };
+    if (toolName) return { name: toolName, arguments: args };
+
+    const natural = inferToolCallFromNaturalText(block, tools);
+    if (natural) return natural;
+
+    throw new Error('Recoverable tool call missing name');
   };
 
-  const emitToolCallFromBlock = async (toolBlock: string, openTag: string) => {
-    const toolCallObj = parseRecoverableToolCallBlock(toolBlock, openTag);
-    const toolName = toolCallObj.name || '';
+  const emitToolCallObject = async (toolCallObj: any) => {
+    const rawToolName = toolCallObj.name || '';
+    const resolvedToolName = resolveDeclaredToolName(rawToolName, tools);
+    const toolName = resolvedToolName || rawToolName;
 
     let toolArgs: Record<string, unknown> = {};
     if (toolCallObj.arguments && typeof toolCallObj.arguments === 'object') {
@@ -304,6 +643,14 @@ async function parseDeepSeekStreamToOpenAI(
     }
 
     if (!toolName) throw new Error('Tool call missing name');
+    if (Array.isArray(tools) && tools.length > 0 && !resolvedToolName) {
+      throw new Error(`Tool call references unavailable tool '${rawToolName}'`);
+    }
+
+    const missingRequired = missingRequiredToolArgs(toolName, toolArgs, tools);
+    if (missingRequired.length > 0) {
+      throw new Error(`Tool call '${toolName}' is missing required argument(s): ${missingRequired.join(', ')}`);
+    }
 
     const toolId = 'call_' + uuidv4();
     const toolCall: ToolCall = {
@@ -315,6 +662,10 @@ async function parseDeepSeekStreamToOpenAI(
     toolCalls.push(toolCall);
     if (emit) await emit(makeChunk(completionId, model, { tool_calls: [toolCall] }));
     emittedToolCallCount++;
+  };
+
+  const emitToolCallFromBlock = async (toolBlock: string, openTag: string) => {
+    await emitToolCallObject(parseRecoverableToolCallBlock(toolBlock, openTag));
   };
 
   while (true) {
@@ -419,8 +770,21 @@ async function parseDeepSeekStreamToOpenAI(
               continue;
             }
 
+            const orphanToolCloseIdx = deferTextForToolDetection
+              ? contentEmitBuffer.toLowerCase().indexOf(TOOL_END)
+              : -1;
+            if (orphanToolCloseIdx !== -1) {
+              pendingToolLeadIn += contentEmitBuffer.substring(0, orphanToolCloseIdx);
+              contentEmitBuffer = contentEmitBuffer.substring(orphanToolCloseIdx + TOOL_END.length);
+              continue;
+            }
+
             const partialStartIdx = findPartialToolOpenIndex(contentEmitBuffer);
             const flushIndex = partialStartIdx === -1 ? contentEmitBuffer.length : partialStartIdx;
+
+            if (deferTextForToolDetection) {
+              break;
+            }
 
             const textToEmit = contentEmitBuffer.substring(0, flushIndex);
             await emitContent(textToEmit);
@@ -440,9 +804,9 @@ async function parseDeepSeekStreamToOpenAI(
             // Never leak internal tool-call XML to the user-visible content.
             // If the call cannot be parsed, restore any normal text that came
             // before it so the OpenAI response is not silently empty.
-            console.warn('[chat] Dropping malformed tool call block:', e);
+            warnToolParser('Dropping malformed tool call block', e);
             if (emittedToolCallCount === 0 && pendingToolLeadIn.trim().length > 0) {
-              await emitContent(pendingToolLeadIn);
+              await emitContent(sanitizeToolArtifacts(pendingToolLeadIn));
             }
             pendingToolLeadIn = '';
           }
@@ -462,16 +826,29 @@ async function parseDeepSeekStreamToOpenAI(
       await emitToolCallFromBlock(contentEmitBuffer.trim(), currentToolOpenTag);
       pendingToolLeadIn = '';
     } catch (e) {
-      console.warn('[chat] Dropping unclosed malformed tool call at end of stream:', e);
+      warnToolParser('Dropping unclosed malformed tool call at end of stream', e);
       if (emittedToolCallCount === 0 && pendingToolLeadIn.trim().length > 0) {
-        await emitContent(pendingToolLeadIn);
+        await emitContent(sanitizeToolArtifacts(pendingToolLeadIn));
       }
       pendingToolLeadIn = '';
     }
   }
 
-  if (!insideTool && contentEmitBuffer.length > 0 && emittedToolCallCount === 0) {
-    await emitContent(contentEmitBuffer);
+  const remainingContent = `${pendingToolLeadIn}${contentEmitBuffer}`;
+  if (!insideTool && remainingContent.length > 0 && emittedToolCallCount === 0) {
+    const plainToolCalls = parsePlainTextToolCalls(remainingContent, tools);
+    if (plainToolCalls.length > 0) {
+      for (const call of plainToolCalls) {
+        await emitToolCallObject(call);
+      }
+    } else {
+      const fallbackContent = deferTextForToolDetection
+        ? sanitizeToolArtifacts(remainingContent)
+        : remainingContent;
+      if (fallbackContent.trim().length > 0) {
+        await emitContent(fallbackContent);
+      }
+    }
   }
 
   const usage: Usage = {
@@ -531,9 +908,19 @@ export async function chatCompletions(c: Context) {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
     const messages = body.messages || [];
+    const resolvedModel = resolveModel(body.model);
+    if (!resolvedModel) {
+      console.warn(`[Chat] Rejected unavailable model '${body.model}'.`);
+      return c.json(modelNotFoundError(body.model), 404);
+    }
 
-    const isThinkingModel = body.model.includes('thinking');
-    const isProModel = body.model.includes('pro');
+    if ((body as any).prompt_cache_key) {
+      console.log(`[Chat] prompt_cache_key accepted: ${String((body as any).prompt_cache_key).slice(0, 80)}`);
+    }
+
+    const isThinkingModel = resolvedModel.thinking;
+    const isProModel = resolvedModel.pro;
+    const telemetryModel = resolvedModel.root;
     const completionId = 'chatcmpl-' + uuidv4();
 
     if (!isStream) {
@@ -545,7 +932,7 @@ export async function chatCompletions(c: Context) {
 
       while (attempt < maxAttempts) {
         attempt++;
-        const telemetry = getModelTelemetry(body.model);
+        const telemetry = getModelTelemetry(telemetryModel);
         const currentTargetLimit = telemetry.detectedLimit;
         
         const compressed = compressMessages(messages, currentTargetLimit, serializeOpenAIMessages);
@@ -570,19 +957,22 @@ export async function chatCompletions(c: Context) {
 
           if (parsed.content === '' && parsed.toolCalls.length === 0) {
             console.warn(`[Chat] Attempt ${attempt} (non-stream) response was empty.`);
-            recordFailure(body.model, promptSize);
+            recordFailure(telemetryModel, promptSize);
             continue;
           }
 
           // Success!
-          recordSuccess(body.model, promptSize);
+          recordSuccess(telemetryModel, promptSize);
           parsedResult = parsed;
           finalUiSessionId = result.uiSessionId;
           break;
         } catch (err: any) {
           console.error(`[Chat] Attempt ${attempt} (non-stream) failed:`, err.message);
           lastError = err;
-          recordFailure(body.model, promptSize);
+          if (isSessionInvalidError(err.message || String(err))) {
+            break;
+          }
+          recordFailure(telemetryModel, promptSize);
           if (attempt >= maxAttempts) {
             break;
           }
@@ -626,7 +1016,7 @@ export async function chatCompletions(c: Context) {
 
     while (attempt < maxAttempts) {
       attempt++;
-      const telemetry = getModelTelemetry(body.model);
+      const telemetry = getModelTelemetry(telemetryModel);
       const currentTargetLimit = telemetry.detectedLimit;
       
       const compressed = compressMessages(messages, currentTargetLimit, serializeOpenAIMessages);
@@ -643,19 +1033,22 @@ export async function chatCompletions(c: Context) {
         const { isEmpty, peekedStream } = await peekStream(result.stream);
         if (isEmpty) {
           console.warn(`[Chat] Attempt ${attempt} (stream) peeked stream was empty.`);
-          recordFailure(body.model, promptSizeUsed);
+          recordFailure(telemetryModel, promptSizeUsed);
           continue;
         }
 
         // Success!
-        recordSuccess(body.model, promptSizeUsed);
+        recordSuccess(telemetryModel, promptSizeUsed);
         deepSeekStream = peekedStream;
         uiSessionId = result.uiSessionId;
         break;
       } catch (err: any) {
         console.error(`[Chat] Attempt ${attempt} (stream) failed:`, err.message);
         lastError = err;
-        recordFailure(body.model, promptSizeUsed);
+        if (isSessionInvalidError(err.message || String(err))) {
+          break;
+        }
+        recordFailure(telemetryModel, promptSizeUsed);
         if (attempt >= maxAttempts) {
           break;
         }
@@ -678,7 +1071,7 @@ export async function chatCompletions(c: Context) {
         await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
       };
 
-      await writeEvent(makeChunk(completionId, body.model, { role: 'assistant', content: '' }));
+      await writeEvent(makeChunk(completionId, body.model, { role: 'assistant' }));
 
       const parsed = await parseDeepSeekStreamToOpenAI(
         deepSeekStream!,
@@ -702,7 +1095,10 @@ export async function chatCompletions(c: Context) {
     if (/account is suspended/i.test(errMessage)) {
       status = 403;
       code = 'deepseek_account_suspended';
-    } else if (/login is required/i.test(errMessage)) {
+    } else if (isSessionInvalidError(errMessage)) {
+      status = 401;
+      code = 'deepseek_session_invalid';
+    } else if (/login is required|No cached DeepSeek session/i.test(errMessage)) {
       status = 401;
       code = 'deepseek_login_required';
     } else if (/chat input unavailable|Timeout waiting for chat input/i.test(errMessage)) {

@@ -32,7 +32,7 @@ export interface MessageToolCall {
 
 export interface Message {
   role: string;
-  content: string | null;
+  content: string | Array<Record<string, unknown>> | null;
   /** Present on assistant messages that invoked tools */
   tool_calls?: MessageToolCall[];
   /** Present on tool/function response messages to link back to a call */
@@ -53,6 +53,13 @@ export interface OpenAIRequest {
   tools?: FunctionToolDefinition[];
   /** Control whether the LLM must/can call tools */
   tool_choice?: ToolChoice;
+  parallel_tool_calls?: boolean;
+  prompt_cache_key?: string;
+  prompt_cache_retention?: 'in_memory' | '24h' | string;
+  stream_options?: {
+    include_usage?: boolean;
+  };
+  metadata?: Record<string, unknown>;
 }
 
 // --- Response Types ---

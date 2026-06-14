@@ -6,7 +6,9 @@
   "scripts": {
     "start": "npx tsx src/index.ts",
     "login": "npx tsx src/login.ts",
-    "test": "tsx --test src/**/*.test.ts",
+    "postinstall": "node scripts/install-playwright.mjs",
+    "update": "node scripts/update.mjs",
+    "test": "API_KEY= tsx --test src/*.test.ts",
     "build": "tsc"
   },
   "keywords": [],

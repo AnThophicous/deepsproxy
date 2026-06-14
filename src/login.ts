@@ -8,7 +8,7 @@
  * Modified By: Pedro Farias
  */
 
-import { initPlaywright, closePlaywright, activePage } from './services/playwright.ts';
+import { initPlaywright, closePlaywright, activePage, getDeepSeekHeaders } from './services/playwright.ts';
 
 async function main() {
   console.log('Opening DeepSeek to allow login...');
@@ -20,14 +20,20 @@ async function main() {
     process.exit(1);
   }
   console.log('Browser opened. Please login to chat.deepseek.com.');
-  console.log('Once you are fully logged in and can see the chat interface, close the browser window or press Ctrl+C here.');
-  
-  // Wait indefinitely until user closes the process
-  process.on('SIGINT', async () => {
-    console.log('Closing browser...');
+  console.log('Waiting until the chat input is available, then DeepsProxy will capture the session cache automatically.');
+
+  try {
+    await activePage.waitForSelector('textarea, [role="textbox"], [contenteditable="true"]', { timeout: 0 });
+    console.log('Login detected. Capturing DeepSeek session headers...');
+    await getDeepSeekHeaders(true, { allowBrowser: true });
+    console.log('Session cache saved. You can now run npm start without keeping Playwright open.');
+  } finally {
     await closePlaywright();
-    process.exit(0);
-  });
+  }
 }
 
-main();
+main().catch(async (error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  await closePlaywright();
+  process.exit(1);
+});

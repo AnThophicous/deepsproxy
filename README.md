@@ -1,478 +1,250 @@
 # DeepsProxy
 
-Proxy API local compatível com OpenAI que roteia requisições para modelos DeepSeek, com integração de automação de navegador via Playwright para execução de ferramentas e interações web.
+DeepsProxy e uma proxy local compativel com rotas OpenAI que usa uma sessao logada do DeepSeek Web por baixo. A ideia e simples: fazer clientes como Zed, Codex CLI, OpenCode e ferramentas OpenAI-compatible chamarem `http://127.0.0.1:3000/v1` sem precisar falar direto com a API oficial do DeepSeek.
 
+> Projeto para uso educacional e pesquisa. Respeite os termos de uso dos servicos que voce conectar.
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.0-blue)](https://www.typescriptlang.org/)
-[![Hono](https://img.shields.io/badge/Hono-4.0-green)](https://hono.dev/)
-[![Playwright](https://img.shields.io/badge/Playwright-1.40-blueviolet)](https://playwright.dev/)
-[![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg)](LICENSE)
+## O Que Ela Faz
 
----
+- Rotas OpenAI-compatible: `/v1/chat/completions`, `/v1/responses`, `/v1/models` e `/v1/models/:model`.
+- Aliases sem `/v1` para clientes que chamam `/chat/completions` ou `/responses`.
+- Streaming SSE no formato esperado por clientes OpenAI-compatible.
+- Tool calling em formato OpenAI, com suporte a `parallel_tool_calls`.
+- Aceita `prompt_cache_key` e `prompt_cache_retention` sem quebrar clientes como Zed.
+- Login via Playwright, com runtime usando cache em `.deepsproxy/deepseek-session.json`.
+- Health check com estado da proxy, rotas e conta DeepSeek.
+- `npm install` baixa somente o Chromium necessario do Playwright.
+- `npm run update` atualiza o repo sem apagar sessao nem `node_modules` manualmente.
 
-## ✨ Features
-
-- **OpenAI API Compatible**: Interface compatível com `/v1/chat/completions` e `/v1/models`
-- **Tool Execution**: Sistema de ferramentas executáveis via Playwright
-- **Session Persistence**: Login persistente com armazenamento de perfil do navegador
-- **Authentication**: Suporte opcional a API Key via header `Authorization` ou `X-API-Key`
-- **Type-Safe**: Código 100% TypeScript com strict mode
-- **Docker Ready**: Deploy simplificado com Docker Compose
-
----
-
-## 🏗️ Arquitetura
-
-```mermaid
-graph TD
-    Client[Cliente OpenAI/SDK] -->|HTTPS| Proxy[DeepsProxy]
-    Proxy -->|/v1/chat/completions| Handler[Chat Handler]
-    Handler --> DeepSeek[DeepSeek API]
-    Handler --> Playwright[Playwright Service]
-    Playwright --> Browser[Navegador Headless]
-    Handler --> Tools[Tools Executor]
-    Tools --> Registry[Tool Registry]
-    
-    subgraph "Configuração"
-        Env[.env] --> Proxy
-        Profile[deepseek_profile/] --> Playwright
-    end
-```
-
----
-
-## 📋 Pré-requisitos
-
-| Dependência | Versão Mínima | Instalação |
-|------------|--------------|-----------|
-| Node.js | v20.x | [nvm](https://github.com/nvm-sh/nvm) |
-| npm | v9.x | Incluído com Node.js |
-| Playwright | - | `npx playwright install` |
-| Docker (opcional) | v24.x | [Docker Docs](https://docs.docker.com/get-docker/) |
-
----
-
-## 🚀 Instalação
-
-### Via npm
+## Instalar
 
 ```bash
-# Clonar repositório
-git clone https://github.com/pedrofariasx/deepsproxy.git
+git clone https://github.com/AnThophicous/deepsproxy.git
 cd deepsproxy
-
-# Instalar dependências
 npm install
-
-# Instalar browsers do Playwright
-npx playwright install
 ```
 
-### Via Docker
+O `npm install` ja instala o Chromium usado pelo Playwright. Para pular esse download:
 
 ```bash
-# Build da imagem
-docker-compose build
-
-# Iniciar containers
-docker-compose up -d
+DEEPSPROXY_SKIP_BROWSER_INSTALL=1 npm install
 ```
 
----
+## Login
 
-## ⚙️ Configuração
+```bash
+npm run login
+```
 
-Crie o arquivo `.env` na raiz do projeto:
+Faça login no DeepSeek na janela aberta. Quando o chat estiver disponível, a DeepsProxy captura a sessão e salva um cache local em `.deepsproxy/deepseek-session.json`. Depois disso, o servidor pode rodar sem manter Playwright aberto.
+
+## Rodar
+
+```bash
+npm start
+```
+
+Ao iniciar, o console mostra a porta e as rotas disponiveis. Cada request tambem aparece no log com metodo, path, status e tempo. O servidor não abre Playwright no startup.
+
+Por padrao a porta e `3000`:
+
+```text
+http://127.0.0.1:3000/v1
+```
+
+## Configuracao
+
+Crie um `.env` se quiser mudar defaults:
 
 ```env
-# Porta do servidor (default: 3000)
 PORT=3000
-
-# Chave de API para proteger endpoints (opcional)
-API_KEY=sua-chave-secreta-aqui
-
-# Configurações Playwright
+API_KEY=
 PLAYWRIGHT_HEADLESS=true
-PLAYWRIGHT_TIMEOUT=30000
-
-# Logging
-LOG_LEVEL=info
+DEEPSPROXY_CHAT_INPUT_TIMEOUT_MS=8000
+DEEPSPROXY_DISABLE_TOOL_PROMPT=false
+DEEPSPROXY_RESPONSES_STORE_PATH=.deepsproxy/responses-store.json
+DEEPSPROXY_RESPONSES_TTL_MS=604800000
+DEEPSPROXY_RESPONSES_MAX_ENTRIES=1000
+DEEPSPROXY_ALLOW_RUNTIME_BROWSER=false
 ```
 
-### Variáveis de Ambiente
+`API_KEY` e opcional. Se definido, clientes precisam enviar `Authorization: Bearer <API_KEY>` ou `X-API-Key: <API_KEY>`.
 
-| Variável | Descrição | Default | Obrigatória |
-|----------|-----------|---------|------------|
-| `PORT` | Porta HTTP do servidor | `3000` | Não |
-| `API_KEY` | Chave para autenticação de requests | - | Não |
-| `PLAYWRIGHT_HEADLESS` | Executar browser em modo headless | `true` | Não |
-| `PLAYWRIGHT_TIMEOUT` | Timeout para operações do Playwright (ms) | `30000` | Não |
+Use `DEEPSPROXY_DISABLE_TOOL_PROMPT=true` quando o cliente ja envia o proprio system prompt e as proprias tools. Isso evita que a proxy injete instrucoes extras de ferramenta por cima do prompt do Zed, Codex ou outro agente.
 
-\* Necessária para funcionalidades que requerem acesso à API DeepSeek
+`DEEPSPROXY_RESPONSES_STORE_PATH`, `DEEPSPROXY_RESPONSES_TTL_MS` e `DEEPSPROXY_RESPONSES_MAX_ENTRIES` controlam o estado local da Responses API. Esse arquivo guarda o historico necessario para `previous_response_id`, entao ele pode conter prompts e tool outputs. Por padrao fica dentro de `.deepsproxy/`, que ja e ignorado pelo Git.
 
----
+Use `DEEPSPROXY_ALLOW_RUNTIME_BROWSER=true` apenas se quiser o comportamento antigo de permitir que requests abram Playwright como fallback. O fluxo recomendado e rodar `npm run login` quando a sessão expirar.
 
-## 🔐 Autenticação
+## Modelos Aceitos
 
-Se `API_KEY` estiver configurada, todas as requisições devem incluir uma das opções:
+IDs principais:
 
-```bash
-# Via Bearer Token
-curl -H "Authorization: Bearer sua-chave" http://localhost:3000/v1/chat/completions
+- `deepseek-v4-flash`
+- `deepseek-v4-flash-thinking`
+- `deepseek-v4-pro`
+- `deepseek-v4-pro-thinking`
 
-# Via X-API-Key header
-curl -H "X-API-Key: sua-chave" http://localhost:3000/v1/chat/completions
-```
+Aliases aceitos:
 
-Resposta para autenticação falha:
-```json
-{ "error": "Unauthorized" }
-```
-Status: `401`
+- `deepseek-flash`
+- `deepseek-flash-thinking`
+- `deepseek-thinking`
+- `deepseek-pro`
+- `deepseek-pro-thinking`
+- `deepseek-chat`
+- `deepseek-reasoner`
 
----
+Modelos fora dessa lista retornam erro OpenAI-compatible `model_not_found`. Isso evita casos em que um cliente tenta usar `gpt-5-mini`, `MiniMax-M3` ou outro ID que a DeepsProxy nao serve.
 
-## 📡 API Reference
+## Zed
 
-### Health Check
+No Zed, adicione um provider OpenAI-compatible apontando para a proxy:
 
-```http
-GET /health
-```
-
-**Response** `200 OK`:
-```json
-{ "status": "ok" }
-```
-
----
-
-### List Models
-
-```http
-GET /v1/models
-```
-
-**Response** `200 OK`:
 ```json
 {
-  "object": "list",
-  "data": [
-    {
-      "id": "deepseek-v4-flash",
-      "object": "model",
-      "created": 1715616000,
-      "owned_by": "deepseek"
-    },
-    {
-      "id": "deepseek-v4-flash-thinking",
-      "object": "model",
-      "created": 1715616000,
-      "owned_by": "deepseek"
-    },
-    {
-      "id": "deepseek-v4-pro",
-      "object": "model",
-      "created": 1715616000,
-      "owned_by": "deepseek"
-    },
-    {
-      "id": "deepseek-v4-pro-thinking",
-      "object": "model",
-      "created": 1715616000,
-      "owned_by": "deepseek"
-    }
-  ]
-}
-```
-
----
-
-### Chat Completions
-
-```http
-POST /v1/chat/completions
-Content-Type: application/json
-```
-
-**Request Body**:
-```json
-{
-  "model": "deepseek-flash-thinking",
-  "messages": [
-    { "role": "user", "content": "Qual é a previsão do tempo?" }
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Obter previsão do tempo",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "location": { "type": "string" }
-          },
-          "required": ["location"]
-        }
+  "language_models": {
+    "openai_compatible": {
+      "deepsproxy": {
+        "api_url": "http://127.0.0.1:3000/v1",
+        "available_models": [
+          {
+            "name": "deepseek-v4-flash-thinking",
+            "display_name": "DeepSeek V4 Flash Thinking",
+            "max_tokens": 64000,
+            "max_output_tokens": 8000,
+            "capabilities": {
+              "tools": true,
+              "images": false,
+              "parallel_tool_calls": true,
+              "prompt_cache_key": true,
+              "chat_completions": true
+            }
+          }
+        ]
       }
     }
-  ],
-  "tool_choice": "auto",
-  "stream": false
-}
-```
-
-**Response** `200 OK`:
-```json
-{
-  "id": "chatcmpl-xxx",
-  "object": "chat.completion",
-  "created": 1715616000,
-  "model": "deepseek-flash-thinking",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "A previsão para São Paulo é de 24°C com sol.",
-        "tool_calls": []
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 45,
-    "completion_tokens": 23,
-    "total_tokens": 68
   }
 }
 ```
 
----
+Se `API_KEY` estiver vazio na proxy, qualquer chave no provider do Zed serve. Se `API_KEY` estiver definido, use a mesma chave no Zed.
 
-## 💻 Exemplos de Uso
+## Codex CLI
 
-### cURL
+Adicione ao `~/.codex/config.toml`:
+
+```toml
+model = "deepseek-v4-flash-thinking"
+model_provider = "deepsproxy"
+
+[model_providers.deepsproxy]
+name = "DeepsProxy"
+base_url = "http://127.0.0.1:3000/v1"
+wire_api = "responses"
+env_key = "DEEPSPROXY_API_KEY"
+request_max_retries = 0
+stream_max_retries = 0
+supports_websockets = false
+```
+
+Se voce definiu `API_KEY` no `.env`, exporte a mesma chave antes de abrir o Codex:
 
 ```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek-flash-thinking",
-    "messages": [{"role": "user", "content": "Olá!"}]
-  }'
+export DEEPSPROXY_API_KEY="sua-chave"
 ```
 
-### OpenAI SDK (Node.js)
-
-```typescript
-import OpenAI from 'openai';
-
-const openai = new OpenAI({
-  baseURL: 'http://localhost:3000/v1',
-  apiKey: process.env.API_KEY || 'sk-no-key-required'
-});
-
-const completion = await openai.chat.completions.create({
-  model: 'deepseek-thinking',
-  messages: [{ role: 'user', content: 'Explique TypeScript' }]
-});
-
-console.log(completion.choices[0].message.content);
-```
-
-### Python (openai library)
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:3000/v1",
-    api_key="sk-no-key-required"
-)
-
-response = client.chat.completions.create(
-    model="deepseek-thinking",
-    messages=[{"role": "user", "content": "Hello!"}]
-)
-
-print(response.choices[0].message.content)
-```
-
----
-
-## 🔧 Comandos Disponíveis
-
-| Comando | Descrição |
-|---------|-----------|
-| `npm start` | Inicia o servidor em produção |
-| `npm run dev` | Inicia com hot-reload para desenvolvimento |
-| `npm run login` | Executa fluxo de login e salva sessão do navegador |
-| `npm test` | Executa suite de testes |
-| `npm run build` | Compila TypeScript para `dist/` |
-| `npx playwright install` | Instala browsers para automação |
-
----
-
-## 📁 Estrutura do Projeto
-
-```
-deepsproxy/
-├── src/
-│   ├── index.ts              # Entry point: servidor Hono + middleware
-│   ├── routes/
-│   │   └── chat.ts          # Handler POST /v1/chat/completions
-│   ├── services/
-│   │   ├── deepseek.ts      # Cliente API DeepSeek
-│   │   └── playwright.ts    # Gerenciamento de browser/session
-│   ├── tools/
-│   │   ├── executor.ts      # Execução dinâmica de ferramentas
-│   │   ├── registry.ts      # Registro e descoberta de tools
-│   │   ├── schema.ts        # Validação de schemas JSON
-│   │   └── types.ts         # Tipos do sistema de tools
-│   ├── runtime/
-│   │   ├── engine.ts        # Motor principal de execução
-│   │   └── types.ts         # Tipos do runtime
-│   ├── types/
-│   │   └── openai.ts        # Tipos compatíveis com OpenAI API
-│   ├── utils/
-│   │   └── types.ts         # Utilitários de tipo
-│   ├── login.ts             # Script de autenticação inicial
-│   ├── index.test.ts        # Testes unitários básicos
-│   └── advanced.test.ts     # Testes de integração avançados
-├── docker-compose.yml        # Orquestração multi-container
-├── Dockerfile                # Imagem Docker otimizada
-├── tsconfig.json            # Configuração TypeScript strict
-├── package.json             # Dependências e scripts
-├── .env.example             # Template de variáveis de ambiente
-└── deepseek_profile/        # Armazenamento de sessão (gitignored)
-```
-
----
-
-## 🐳 Docker
-
-### docker-compose.yml
-
-```yaml
-services:
-  deepsproxy:
-    build: .
-    ports:
-      - "3000:3000"
-    environment:
-      - PORT=3000
-      - PLAYWRIGHT_HEADLESS=true
-    volumes:
-      - ./deepseek_profile:/app/deepseek_profile
-    restart: unless-stopped
-```
-
-### Build e Execução
+Se `API_KEY` estiver vazio, pode usar qualquer valor local:
 
 ```bash
-# Build
-docker-compose build
-
-# Executar em background
-docker-compose up -d
-
-# Ver logs
-docker-compose logs -f
-
-# Parar
-docker-compose down
+export DEEPSPROXY_API_KEY="sk-local"
 ```
 
----
+## Responses API E Continuidade
 
-## 🧪 Testes
+`/v1/responses` retorna IDs no formato `resp_...` e aceita `previous_response_id`. Isso permite que clientes como Codex mantenham estado entre turnos sem reenviar toda a conversa manualmente.
+
+Quando `store` nao e `false`, a proxy salva localmente:
+
+- mensagens de usuario;
+- resposta final do assistente;
+- chamadas de ferramenta com `call_id`;
+- outputs de ferramentas enviados no turno seguinte.
+
+Na proxima request com `previous_response_id`, a DeepsProxy reconstrói o contexto no formato interno usado pelo DeepSeek Web e preserva a ordem `system/instructions -> historico -> input atual`. O estado tambem sobrevive a restart do servidor porque e persistido em `.deepsproxy/responses-store.json`.
+
+Limite importante: isso replica a semantica de continuidade da OpenAI para o cliente, mas o DeepSeek Web nao oferece um storage server-side igual ao da OpenAI. Entao a economia real de tokens depende do upstream; a DeepsProxy garante compatibilidade de protocolo e historico, nao uma reducao magica de contexto no DeepSeek.
+
+## Health Check
 
 ```bash
-# Executar todos os testes
-npm test
-
-# Executar com watch mode
-npm run test:watch
-
-# Executar testes específicos
-npm test -- src/index.test.ts
-
-# Coverage report
-npm run test:coverage
+curl http://127.0.0.1:3000/health
+curl http://127.0.0.1:3000/v1/health
 ```
 
----
-
-## 🔍 Troubleshooting
-
-### Playwright não inicializa
+Para forcar uma checagem ativa da sessao DeepSeek:
 
 ```bash
-# Reinstalar browsers
-npx playwright install --with-deps
-
-# Verificar dependências do sistema
-npx playwright install-deps
+curl "http://127.0.0.1:3000/health?probe=1"
 ```
 
-### Erro de autenticação
+A resposta mostra:
 
-- Verifique se `API_KEY` no `.env` corresponde ao header enviado
-- Teste sem `API_KEY` configurada para isolar o problema
+- `status`: estado geral da proxy.
+- `server.routes`: rotas expostas.
+- `upstream.accounts`: estado da conta DeepSeek (`ready`, `needs_login`, `suspended`, `not_initialized`, `not_checked` ou `unavailable`).
+- `authorization_captured`: se a proxy ja conseguiu capturar header de autenticacao da sessao.
 
-### Timeout em requests
+## Rotas
 
-- Aumente `PLAYWRIGHT_TIMEOUT` no `.env`
-- Verifique conectividade com a API DeepSeek
-- Considere executar com `PLAYWRIGHT_HEADLESS=false` para debug visual
+```text
+GET  /health
+GET  /v1/health
+GET  /v1/models
+GET  /v1/models/:model
+POST /v1/chat/completions
+POST /v1/responses
+GET  /v1/responses/:response_id
+POST /v1/responses/:response_id/cancel
+POST /chat/completions
+POST /responses
+```
 
-### Sessão não persiste
+## Atualizar
 
-- Certifique-se que `deepseek_profile/` tem permissões de escrita
-- Execute `npm run login` para renovar a sessão
+```bash
+npm run update
+```
 
----
+O updater:
 
-## 🤝 Contribuindo
+- busca commits novos do remote atual;
+- aplica update somente se for fast-forward;
+- nao apaga `deepseek_profile/`;
+- preserva a sessao logada;
+- roda `npm install` para atualizar dependencias;
+- roda `npm run build` no final.
 
-1. Fork o repositório
-2. Crie uma branch para sua feature: `git checkout -b feature/minha-feature`
-3. Commit suas mudanças: `git commit -m 'feat: adiciona minha feature'`
-4. Push para a branch: `git push origin feature/minha-feature`
-5. Abra um Pull Request
+Se existirem alteracoes locais em arquivos rastreados, ele para antes de mexer no repo.
 
-### Guidelines de Código
+## Docker
 
-- Siga o padrão TypeScript strict
-- Adicione testes para novas funcionalidades
-- Mantenha compatibilidade com OpenAI API spec
+```bash
+docker compose build
+docker compose up -d
+docker compose logs -f
+```
 
----
+Monte `deepseek_profile/` como volume para manter a sessao entre reinicios.
 
-## 📄 License
+## Troubleshooting
 
-Distribuído sob licença ISC. Veja `LICENSE` para mais informações.
+`model_not_found`: o cliente enviou um modelo que nao esta na lista aceita. Configure Zed/Codex para usar `deepseek-v4-flash-thinking` ou outro ID listado acima.
 
----
+`endpoint_not_found`: o cliente chamou uma rota que a proxy nao expoe. Use `http://127.0.0.1:3000/v1` como base URL.
 
-## ⚠️ Disclaimer
+`deepseek_login_required`: rode `npm run login` novamente.
 
-> Este projeto é fornecido estritamente para fins educacionais e de pesquisa.
+`deepseek_account_suspended`: a pagina do DeepSeek indicou suspensao da conta. A proxy nao apaga a sessao automaticamente sem certeza.
 
-Os autores não incentivam ou endossam:
-- Uso indevido ou malicioso
-- Automação não autorizada de serviços terceiros
-- Violação de Termos de Serviço de plataformas
-- Atividades que violem leis ou regulamentações aplicáveis
-
-Usuários são integralmente responsáveis pelo uso deste software, incluindo conformidade com leis, regulamentos e contratos de serviço aplicáveis.
-
-Este repositório demonstra conceitos relacionados a:
-- Automação de navegadores com Playwright
-- Gerenciamento de sessões e autenticação
-- Arquiteturas de runtime compatíveis com OpenAI
-- Padrões de proxy e roteamento de API
-
-**Use por sua conta e risco.**
+`upstream_error`: a proxy conseguiu receber a request, mas o DeepSeek falhou ou nao retornou stream valido.

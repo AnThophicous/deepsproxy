@@ -71,7 +71,7 @@ export interface MessageToolCall {
 
 export interface Message {
   role: string;
-  content: string | null;
+  content: string | Array<Record<string, unknown>> | null;
   tool_calls?: MessageToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -86,6 +86,13 @@ export interface OpenAIRequest {
   stream?: boolean;
   tools?: FunctionToolDefinition[];
   tool_choice?: ToolChoice;
+  parallel_tool_calls?: boolean;
+  prompt_cache_key?: string;
+  prompt_cache_retention?: 'in_memory' | '24h' | string;
+  stream_options?: {
+    include_usage?: boolean;
+  };
+  metadata?: Record<string, unknown>;
 }
 
 // ─── Streaming Response ────────────────────────────────────────────────────────

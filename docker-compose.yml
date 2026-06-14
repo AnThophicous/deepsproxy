@@ -1,12 +1,15 @@
-version: '3.8'
 services:
   deepsproxy:
     build: .
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:3000"
     environment:
-      - PORT=3000
-      - API_KEY=sua_api_key_aqui
+      PORT: 3000
+      API_KEY: ${API_KEY:-}
+      PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-true}
+      DEEPSPROXY_CHAT_INPUT_TIMEOUT_MS: ${DEEPSPROXY_CHAT_INPUT_TIMEOUT_MS:-8000}
+      DEEPSPROXY_DISABLE_TOOL_PROMPT: ${DEEPSPROXY_DISABLE_TOOL_PROMPT:-false}
     volumes:
       - ./deepseek_profile:/app/deepseek_profile
+    shm_size: "1gb"
     restart: unless-stopped
